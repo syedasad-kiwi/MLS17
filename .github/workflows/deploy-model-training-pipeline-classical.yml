@@ -1,1 +1,137 @@
+name: Deploy ML Training Pipeline
 
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'data-science/**'
+      - 'mlops/azureml/train/**'
+      - 'data/**'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'data-science/**'
+      - 'mlops/azureml/train/**'
+      - 'data/**'
+  workflow_dispatch:
+    inputs:
+      environmentName:
+        description: 'Environment name (dev, test, prod)'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - test
+          - prod
+
+env:
+  # Azure ML workspace details
+  AZURE_RESOURCE_GROUP: "rg-mlops-${{ github.event.inputs.environmentName || 'dev' }}"
+  AZURE_ML_WORKSPACE: "mlw-${{ github.event.inputs.environmentName || 'dev' }}"
+  AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+jobs:
+  lint:
+    name: Code Quality Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.7'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run linting
+        run: |
+          flake8 data-science/src/
+          black --check data-science/src/
+          isort --check-only --profile black data-science/src/
+
+  deploy-assets:
+    name: Deploy Azure ML Assets
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.7'
+
+      - name: Install Azure ML CLI
+        run: |
+          python -m pip install --upgrade pip
+          pip install azure-ai-ml==1.0.0 azure-identity
+
+      - name: Azure login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Register environment
+        run: |
+          az ml environment create --file mlops/azureml/train/train-env.yml \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+            --workspace-name ${{ env.AZURE_ML_WORKSPACE }} \
+            --subscription ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Register dataset
+        run: |
+          az ml data create --file mlops/azureml/train/data.yml \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+            --workspace-name ${{ env.AZURE_ML_WORKSPACE }} \
+            --subscription ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+  deploy-pipeline:
+    name: Deploy and Run Training Pipeline
+    needs: deploy-assets
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.7'
+
+      - name: Install Azure ML CLI
+        run: |
+          python -m pip install --upgrade pip
+          pip install azure-ai-ml==1.0.0 azure-identity
+
+      - name: Azure login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Create Pipeline Job
+        id: create_pipeline
+        run: |
+          PIPELINE_JOB_NAME="machine-failure-training-$(date +%Y%m%d%H%M%S)"
+          echo "Creating pipeline job: $PIPELINE_JOB_NAME"
+          
+          az ml job create --file mlops/azureml/train/newpipeline.yml \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+            --workspace-name ${{ env.AZURE_ML_WORKSPACE }} \
+            --subscription ${{ env.AZURE_SUBSCRIPTION_ID }} \
+            --name $PIPELINE_JOB_NAME \
+            --set display_name=$PIPELINE_JOB_NAME
+          
+          echo "pipeline_job_name=$PIPELINE_JOB_NAME" >> $GITHUB_OUTPUT
+
+      - name: Show Pipeline Job URL
+        run: |
+          echo "Pipeline job ${{ steps.create_pipeline.outputs.pipeline_job_name }} created"
+          echo "View the pipeline job in Azure ML studio: https://ml.azure.com/runs/${{ steps.create_pipeline.outputs.pipeline_job_name }}?wsid=/subscriptions/${{ env.AZURE_SUBSCRIPTION_ID }}/resourceGroups/${{ env.AZURE_RESOURCE_GROUP }}/providers/Microsoft.MachineLearningServices/workspaces/${{ env.AZURE_ML_WORKSPACE }}"
